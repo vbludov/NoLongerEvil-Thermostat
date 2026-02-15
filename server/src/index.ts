@@ -39,6 +39,40 @@ const integrationManager = new IntegrationManager();
 const deviceInitialization = new DeviceInitialization();
 const availabilityWatchdog = new DeviceAvailabilityWatchdog();
 
+type UiLogEntry = {
+  ts: number;
+  api: 'device' | 'control';
+  method: string;
+  path: string;
+  statusCode?: number;
+  durationMs?: number;
+  serial?: string;
+};
+
+const UI_LOG_MAX_ENTRIES = 500;
+const uiLogBuffer: UiLogEntry[] = [];
+const uiLogSseClients = new Set<http.ServerResponse>();
+
+function uiLogPush(entry: UiLogEntry): void {
+  uiLogBuffer.push(entry);
+  while (uiLogBuffer.length > UI_LOG_MAX_ENTRIES) {
+    uiLogBuffer.shift();
+  }
+
+  const payload = JSON.stringify(entry);
+  for (const client of uiLogSseClients) {
+    if (client.writableEnded || client.destroyed) {
+      uiLogSseClients.delete(client);
+      continue;
+    }
+    try {
+      client.write(`data: ${payload}\n\n`);
+    } catch {
+      uiLogSseClients.delete(client);
+    }
+  }
+}
+
 /**
  * Parse JSON request body
  */
@@ -128,12 +162,17 @@ const UI_HTML = `<!doctype html>
     <h2>Device State</h2>
     <pre id="deviceState">Select a device to view state.</pre>
 
+    <h2>Live Request Log</h2>
+    <p class="muted">Shows recent requests handled by this server. Auto-updates in real time.</p>
+    <pre id="liveLog">Connecting...</pre>
+
     <script>
       const statusEl = document.getElementById('status');
       const tbody = document.querySelector('#devicesTable tbody');
       const deviceStateEl = document.getElementById('deviceState');
       const serialInput = document.getElementById('serialInput');
       const entryKeyOut = document.getElementById('entryKeyOut');
+      const liveLogEl = document.getElementById('liveLog');
 
       function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -212,6 +251,59 @@ const UI_HTML = `<!doctype html>
       document.getElementById('refresh').addEventListener('click', refreshDevices);
       document.getElementById('genKey').addEventListener('click', () => generateEntryKey(serialInput.value.trim()));
 
+      function formatLogLine(e) {
+        const d = new Date(e.ts);
+        const t = d.toLocaleTimeString();
+        const serial = e.serial ? (' serial=' + e.serial) : '';
+        const status = (typeof e.statusCode === 'number') ? (' ' + e.statusCode) : '';
+        const dur = (typeof e.durationMs === 'number') ? (' ' + e.durationMs + 'ms') : '';
+        return '[' + t + '] ' + e.api.toUpperCase() + ' ' + e.method + ' ' + e.path + status + dur + serial;
+      }
+
+      function appendLog(entry) {
+        if (!liveLogEl) return;
+        const lines = liveLogEl.textContent ? liveLogEl.textContent.split('\n') : [];
+        if (lines.length === 1 && lines[0] === 'Connecting...') {
+          lines.length = 0;
+        }
+        lines.push(formatLogLine(entry));
+        const maxLines = 300;
+        while (lines.length > maxLines) lines.shift();
+        liveLogEl.textContent = lines.join('\n');
+      }
+
+      async function loadLogHistory() {
+        try {
+          const history = await api('/ui/api/logs');
+          if (Array.isArray(history)) {
+            liveLogEl.textContent = '';
+            for (const item of history) appendLog(item);
+          }
+        } catch (e) {
+          liveLogEl.textContent = 'Failed to load log history: ' + e.message;
+        }
+      }
+
+      function connectLogStream() {
+        try {
+          const es = new EventSource('/ui/api/logs/stream');
+          es.onmessage = (evt) => {
+            try {
+              appendLog(JSON.parse(evt.data));
+            } catch {
+              // ignore
+            }
+          };
+          es.onerror = () => {
+            // Browser will auto-reconnect; keep the text as-is
+          };
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      loadLogHistory();
+      connectLogStream();
       refreshDevices();
     </script>
   </body>
@@ -226,6 +318,20 @@ async function handleDeviceRequest(req: http.IncomingMessage, res: http.ServerRe
   const parsedUrl = url.parse(req.url || '', true);
   const pathname = parsedUrl.pathname || '/';
   const method = req.method || 'GET';
+
+  const startedAt = Date.now();
+  const requestSerial = resolveDeviceSerial(req) || undefined;
+  res.on('finish', () => {
+    uiLogPush({
+      ts: startedAt,
+      api: 'device',
+      method,
+      path: pathname,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startedAt,
+      serial: requestSerial,
+    });
+  });
 
   console.log(`[Device API] ${method} ${pathname}`);
 
@@ -242,6 +348,42 @@ async function handleDeviceRequest(req: http.IncomingMessage, res: http.ServerRe
 
     if (pathname === '/ui' && method === 'GET') {
       sendHtml(res, 200, UI_HTML);
+      return;
+    }
+
+    if (pathname === '/ui/api/logs' && method === 'GET') {
+      sendJson(res, 200, uiLogBuffer.slice(-200));
+      return;
+    }
+
+    if (pathname === '/ui/api/logs/stream' && method === 'GET') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+      });
+      res.write('retry: 2000\n\n');
+      uiLogSseClients.add(res);
+
+      const keepAlive = setInterval(() => {
+        if (res.writableEnded || res.destroyed) {
+          clearInterval(keepAlive);
+          uiLogSseClients.delete(res);
+          return;
+        }
+        try {
+          res.write(':keep-alive\n\n');
+        } catch {
+          clearInterval(keepAlive);
+          uiLogSseClients.delete(res);
+        }
+      }, 15000);
+
+      res.on('close', () => {
+        clearInterval(keepAlive);
+        uiLogSseClients.delete(res);
+      });
+
       return;
     }
 
@@ -373,6 +515,18 @@ async function handleControlRequest(req: http.IncomingMessage, res: http.ServerR
   const parsedUrl = url.parse(req.url || '', true);
   const pathname = parsedUrl.pathname || '/';
   const method = req.method || 'GET';
+
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    uiLogPush({
+      ts: startedAt,
+      api: 'control',
+      method,
+      path: pathname,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startedAt,
+    });
+  });
 
   console.log(`[Control API] ${method} ${pathname}`);
 
