@@ -45,7 +45,7 @@ const availabilityWatchdog = new DeviceAvailabilityWatchdog();
 function parseJsonBody(req: http.IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', chunk => {
+    req.on('data', (chunk: Buffer) => {
       body += chunk.toString();
     });
     req.on('end', () => {
@@ -76,6 +76,147 @@ function sendError(res: http.ServerResponse, statusCode: number, message: string
   res.end(JSON.stringify({ error: message }));
 }
 
+function sendHtml(res: http.ServerResponse, statusCode: number, html: string): void {
+  res.writeHead(statusCode, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
+}
+
+const UI_HTML = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>No Longer Evil - Devices</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+      input, button, select { font: inherit; padding: 8px 10px; }
+      button { cursor: pointer; }
+      pre { padding: 12px; border: 1px solid rgba(127,127,127,0.3); overflow: auto; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { text-align: left; padding: 8px; border-bottom: 1px solid rgba(127,127,127,0.3); }
+      .muted { opacity: 0.8; }
+    </style>
+  </head>
+  <body>
+    <h1>No Longer Evil</h1>
+    <p class="muted">GUI served by the Device API on port 80. Device endpoints under <code>/nest/*</code> remain unchanged.</p>
+
+    <h2>Known Devices</h2>
+    <div class="row">
+      <button id="refresh">Refresh</button>
+      <span id="status" class="muted"></span>
+    </div>
+    <table id="devicesTable" aria-label="devices">
+      <thead>
+        <tr>
+          <th>Serial</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <h2>Pair / Add device (generate entry key)</h2>
+    <div class="row">
+      <input id="serialInput" placeholder="Enter device serial" />
+      <button id="genKey">Generate entry key</button>
+      <span id="entryKeyOut" class="muted"></span>
+    </div>
+
+    <h2>Device State</h2>
+    <pre id="deviceState">Select a device to view state.</pre>
+
+    <script>
+      const statusEl = document.getElementById('status');
+      const tbody = document.querySelector('#devicesTable tbody');
+      const deviceStateEl = document.getElementById('deviceState');
+      const serialInput = document.getElementById('serialInput');
+      const entryKeyOut = document.getElementById('entryKeyOut');
+
+      function setStatus(msg) { statusEl.textContent = msg; }
+
+      async function api(path, options) {
+        const res = await fetch(path, options);
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          throw new Error(text || ('HTTP ' + res.status));
+        }
+        const ct = res.headers.get('content-type') || '';
+        return ct.includes('application/json') ? res.json() : res.text();
+      }
+
+      async function refreshDevices() {
+        setStatus('Loading...');
+        tbody.innerHTML = '';
+        try {
+          const data = await api('/ui/api/devices');
+          const devices = data.devices || [];
+          if (devices.length === 0) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = '<td colspan="2" class="muted">No devices have reported state yet.</td>';
+            tbody.appendChild(tr);
+          } else {
+            for (const serial of devices) {
+              const tr = document.createElement('tr');
+              const tdSerial = document.createElement('td');
+              tdSerial.textContent = serial;
+              const tdActions = document.createElement('td');
+              const viewBtn = document.createElement('button');
+              viewBtn.textContent = 'View state';
+              viewBtn.onclick = () => loadDeviceState(serial);
+              tdActions.appendChild(viewBtn);
+              tr.appendChild(tdSerial);
+              tr.appendChild(tdActions);
+              tbody.appendChild(tr);
+            }
+          }
+          setStatus('Loaded ' + devices.length + ' device(s).');
+        } catch (e) {
+          setStatus('Error: ' + e.message);
+        }
+      }
+
+      async function loadDeviceState(serial) {
+        setStatus('Loading state for ' + serial + '...');
+        try {
+          const data = await api('/ui/api/device?serial=' + encodeURIComponent(serial));
+          deviceStateEl.textContent = JSON.stringify(data, null, 2);
+          setStatus('Loaded state for ' + serial + '.');
+        } catch (e) {
+          deviceStateEl.textContent = 'Failed to load state: ' + e.message;
+          setStatus('Error: ' + e.message);
+        }
+      }
+
+      async function generateEntryKey(serial) {
+        entryKeyOut.textContent = '';
+        setStatus('Generating entry key...');
+        try {
+          const data = await api('/ui/api/entry-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ serial })
+          });
+          entryKeyOut.textContent = data && data.code
+            ? ('Entry key: ' + data.code + ' (expires: ' + new Date(data.expiresAt).toLocaleString() + ')')
+            : 'No key returned.';
+          setStatus('Entry key generated.');
+        } catch (e) {
+          entryKeyOut.textContent = 'Error: ' + e.message;
+          setStatus('Error: ' + e.message);
+        }
+      }
+
+      document.getElementById('refresh').addEventListener('click', refreshDevices);
+      document.getElementById('genKey').addEventListener('click', () => generateEntryKey(serialInput.value.trim()));
+
+      refreshDevices();
+    </script>
+  </body>
+</html>`;
+
 /**
  * Main request handler for device API (PROXY_PORT)
  */
@@ -93,6 +234,50 @@ async function handleDeviceRequest(req: http.IncomingMessage, res: http.ServerRe
   }
 
   try {
+    if (pathname === '/' && method === 'GET') {
+      res.writeHead(302, { Location: '/ui' });
+      res.end();
+      return;
+    }
+
+    if (pathname === '/ui' && method === 'GET') {
+      sendHtml(res, 200, UI_HTML);
+      return;
+    }
+
+    if (pathname === '/ui/api/devices' && method === 'GET') {
+      const allState = await deviceStateManager.getAllState();
+      sendJson(res, 200, { devices: Object.keys(allState) });
+      return;
+    }
+
+    if (pathname === '/ui/api/device' && method === 'GET') {
+      const serial = (parsedUrl.query.serial as string | undefined) || '';
+      if (!serial) {
+        sendError(res, 400, 'Missing serial');
+        return;
+      }
+      const deviceState = await deviceStateManager.getDeviceState(serial);
+      sendJson(res, 200, { serial, state: deviceState });
+      return;
+    }
+
+    if (pathname === '/ui/api/entry-key' && method === 'POST') {
+      const body = await parseJsonBody(req);
+      const serial = String(body?.serial || '').trim();
+      if (!serial) {
+        sendError(res, 400, 'Missing serial');
+        return;
+      }
+      const key = await deviceStateManager.generateEntryKey(serial, environment.ENTRY_KEY_TTL_SECONDS);
+      if (!key) {
+        sendError(res, 500, 'Failed to generate entry key');
+        return;
+      }
+      sendJson(res, 200, key);
+      return;
+    }
+
     if (pathname === '/nest/entry') {
       if (environment.DEBUG_LOGGING) {
         logRequest(req);
