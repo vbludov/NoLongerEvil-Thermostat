@@ -17,7 +17,7 @@ import { handlePing } from './routes/nest/ping';
 import { handleUpload } from './routes/nest/upload';
 import { handleWeather } from './routes/nest/weather';
 import { handleCommand } from './routes/control/command';
-import { handleStatus, handleDevices, handleNotifyDevice } from './routes/control/status';
+import { handleStatus, handleNotifyDevice } from './routes/control/status';
 import { normalizeUrl } from './middleware/urlNormalizer';
 import { logRequest, createResponseLogger, initDebugLogsDir } from './middleware/debugLogger';
 import { IntegrationManager } from './integrations/IntegrationManager';
@@ -287,6 +287,11 @@ const UI_HTML = `<!doctype html>
       function connectLogStream() {
         try {
           const es = new EventSource('/ui/api/logs/stream');
+          es.onopen = () => {
+            if (liveLogEl && liveLogEl.textContent === 'Connecting...') {
+              liveLogEl.textContent = '';
+            }
+          };
           es.onmessage = (evt) => {
             try {
               appendLog(JSON.parse(evt.data));
@@ -295,7 +300,10 @@ const UI_HTML = `<!doctype html>
             }
           };
           es.onerror = () => {
-            // Browser will auto-reconnect; keep the text as-is
+            // Browser will auto-reconnect; show a hint if we have no content yet
+            if (liveLogEl && !liveLogEl.textContent) {
+              liveLogEl.textContent = 'Connecting...';
+            }
           };
         } catch (e) {
           // ignore
@@ -420,6 +428,46 @@ async function handleDeviceRequest(req: http.IncomingMessage, res: http.ServerRe
       return;
     }
 
+    if (pathname.startsWith('/ui/api/')) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+      if (method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+    }
+
+    if (pathname === '/ui/api/command' && method === 'POST') {
+      const body = await parseJsonBody(req);
+      if (environment.DEBUG_LOGGING) {
+        logRequest(req, body);
+      }
+      const result = await handleCommand(body, deviceStateService, subscriptionManager);
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (pathname === '/ui/api/status' && method === 'GET') {
+      if (environment.DEBUG_LOGGING) {
+        logRequest(req);
+      }
+      handleStatus(req, res, deviceStateService);
+      return;
+    }
+
+    if (pathname === '/ui/api/notify-device' && method === 'POST') {
+      const body = await parseJsonBody(req);
+      if (environment.DEBUG_LOGGING) {
+        logRequest(req, body);
+      }
+      const result = await handleNotifyDevice(body, deviceStateService, subscriptionManager);
+      sendJson(res, 200, result);
+      return;
+    }
+
     if (pathname === '/nest/entry') {
       if (environment.DEBUG_LOGGING) {
         logRequest(req);
@@ -508,85 +556,6 @@ async function handleDeviceRequest(req: http.IncomingMessage, res: http.ServerRe
   }
 }
 
-/**
- * Main request handler for control API (CONTROL_PORT)
- */
-async function handleControlRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const parsedUrl = url.parse(req.url || '', true);
-  const pathname = parsedUrl.pathname || '/';
-  const method = req.method || 'GET';
-
-  const startedAt = Date.now();
-  res.on('finish', () => {
-    uiLogPush({
-      ts: startedAt,
-      api: 'control',
-      method,
-      path: pathname,
-      statusCode: res.statusCode,
-      durationMs: Date.now() - startedAt,
-    });
-  });
-
-  console.log(`[Control API] ${method} ${pathname}`);
-
-  if (environment.DEBUG_LOGGING) {
-    createResponseLogger(req, res);
-  }
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (method === 'OPTIONS') {
-    res.writeHead(200);
-    res.end();
-    return;
-  }
-
-  try {
-    if (pathname === '/command' && method === 'POST') {
-      const body = await parseJsonBody(req);
-      if (environment.DEBUG_LOGGING) {
-        logRequest(req, body);
-      }
-      const result = await handleCommand(body, deviceStateService, subscriptionManager);
-      sendJson(res, 200, result);
-      return;
-    }
-
-    if (pathname === '/status' && method === 'GET') {
-      if (environment.DEBUG_LOGGING) {
-        logRequest(req);
-      }
-      handleStatus(req, res, deviceStateService);
-      return;
-    }
-
-    if (pathname === '/api/devices' && method === 'GET') {
-      if (environment.DEBUG_LOGGING) {
-        logRequest(req);
-      }
-      handleDevices(req, res, deviceStateService);
-      return;
-    }
-
-    if (pathname === '/notify-device' && method === 'POST') {
-      const body = await parseJsonBody(req);
-      if (environment.DEBUG_LOGGING) {
-        logRequest(req, body);
-      }
-      const result = await handleNotifyDevice(body, deviceStateService, subscriptionManager);
-      sendJson(res, 200, result);
-      return;
-    }
-
-    sendError(res, 404, 'Not Found');
-  } catch (error) {
-    console.error('[Control API] Error:', error);
-    sendError(res, 500, error instanceof Error ? error.message : 'Internal Server Error');
-  }
-}
 
 /**
  * Create HTTPS server if certificates are available
@@ -626,20 +595,25 @@ function createHttpsServer(): https.Server | null {
 async function startServers(): Promise<void> {
   const httpsServer = createHttpsServer();
   if (httpsServer) {
+    httpsServer.on('error', err => {
+      console.error(`[Device API] Failed to listen on port ${environment.PROXY_PORT}:`, err);
+      console.error('[Device API] If this is EACCES or EADDRINUSE, run as admin or change PROXY_PORT.');
+    });
     httpsServer.listen(environment.PROXY_PORT, () => {
       console.log(`[Device API] HTTPS server listening on port ${environment.PROXY_PORT}`);
     });
   } else {
     const httpServer = http.createServer(handleDeviceRequest);
+    httpServer.on('error', err => {
+      console.error(`[Device API] Failed to listen on port ${environment.PROXY_PORT}:`, err);
+      console.error('[Device API] If this is EACCES or EADDRINUSE, run as admin or change PROXY_PORT.');
+    });
     httpServer.listen(environment.PROXY_PORT, () => {
       console.log(`[Device API] HTTP server listening on port ${environment.PROXY_PORT}`);
     });
   }
 
-  const controlServer = http.createServer(handleControlRequest);
-  controlServer.listen(environment.CONTROL_PORT, '127.0.0.1', () => {
-    console.log(`[Control API] HTTP server listening on localhost:${environment.CONTROL_PORT}`);
-  });
+  console.log('[Control API] Control endpoints consolidated on port 80 under /ui/api/*');
 
   console.log('[Integrations] Loading enabled integrations...');
   await integrationManager.initialize(deviceStateManager, deviceStateService, subscriptionManager);

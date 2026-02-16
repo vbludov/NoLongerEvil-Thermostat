@@ -13,6 +13,6 @@ COPY ./package*.json ./
 RUN npm install
 COPY --from=builder /app/dist ./dist
 
-EXPOSE 80 443 8081
+EXPOSE 80 443
 
 CMD ["node", "dist/index.js"]
